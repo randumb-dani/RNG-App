@@ -6,21 +6,16 @@
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { emit } from '@tauri-apps/api/event';
   import { listen } from '@tauri-apps/api/event';
+  import InputSidebar from './lib/InputSidebar.svelte';
+  import OutputSidebar from './lib/OutputSidebar.svelte';
 
-  import clearIcon from './assets/Clear.svg?raw';
-  import saveIcon from './assets/Save.svg?raw';
-  import importIcon from './assets/Import.svg?raw';
-  import dockIcon from './assets/Dock.svg?raw';
-  import undockIcon from './assets/Undock.svg?raw';
-  import addIcon from './assets/Add.svg?raw';
-  import removeIcon from './assets/Remove.svg?raw';
-  import unselectIcon from './assets/Unselect.svg?raw';
   import colorIcon from './assets/Color.svg?raw';
   import settingsIcon from './assets/Settings.svg?raw';
   import volumeMuteIcon from './assets/Volume-mute.svg?raw';
   import volumeLowIcon from './assets/Volume-low.svg?raw';
   import volumeHighIcon from './assets/Volume-high.svg?raw';
-  import dragIndicatorIcon from './assets/DragIndicator.svg?raw';
+  import dockIcon from './assets/Dock.svg?raw';
+  import undockIcon from './assets/Undock.svg?raw';
 
 import addSound from './assets/Add.m4a?url';
   import removeSound from './assets/Remove.m4a?url';
@@ -71,7 +66,7 @@ import addSound from './assets/Add.m4a?url';
   // --- New settings ---
   let theme = $state(localStorage.getItem('rng-theme') || 'dark');
   let particlesEnabled = $state(localStorage.getItem('rng-particles') !== 'false');
-  let volume = $state(parseFloat(localStorage.getItem('rng-volume') ?? '1'));
+  let volume = $state((function () { const v = parseFloat(localStorage.getItem('rng-volume')); return Number.isFinite(v) ? v : 1; })());
   let shortcutKeys = $state(JSON.parse(localStorage.getItem('rng-shortcut') || 'null') || { alt: false, shift: true, ctrl: true, key: 'g', code: 'KeyG' });
   let shortcutDisplay = $derived([shortcutKeys.ctrl && 'Ctrl', shortcutKeys.alt && 'Alt', shortcutKeys.shift && 'Shift', shortcutKeys.key?.toUpperCase()].filter(Boolean).join(' + '));
   let recordingShortcut = $state(false);
@@ -102,6 +97,7 @@ import addSound from './assets/Add.m4a?url';
       if (ghost) { ghost.remove(); ghost = null; }
       node.querySelectorAll('.list-item').forEach(el => {
         el.classList.remove('dragging', 'drop-target');
+        delete el.dataset.dragAttempted;
       });
       node.classList.remove('is-dragging');
       fromIndex = -1;
@@ -319,12 +315,11 @@ import addSound from './assets/Add.m4a?url';
   }
 
   let canvasRef = null;
-  let outputCanvasRef = null;
   let latestFieldRef = null;
   let centerPanelRef = null;
   let hueTrackRef = null;
   let particleSystem = $state(null);
-  let outputParticleSystem = $state(null);
+  let outputGenerationCount = $state(0);
   let prevOutputsLen = 0;
   let resizeObserver = null;
   let shortcutHandler = null;
@@ -434,9 +429,12 @@ import addSound from './assets/Add.m4a?url';
     if (state) {
       inputs = state.inputs || [];
       outputs = state.outputs || [];
-      outputMode = state.output_mode || 'single';
+      if (state.output_mode === 'single' || state.output_mode === 'batch') {
+        outputMode = state.output_mode;
+      }
 
       if (outputs.length > prevOutputsLen) {
+        outputGenerationCount++;
         await tick();
         const lastOutputEl = document.querySelector('.latest-output-item');
         if (lastOutputEl) {
@@ -489,7 +487,7 @@ import addSound from './assets/Add.m4a?url';
   }
 
   function setupDocumentShortcut() {
-    if (shortcutHandler) document.removeEventListener('keydown', shortcutHandler);
+    if (shortcutHandler) document.removeEventListener('keydown', shortcutHandler, true);
     shortcutHandler = (e) => {
       if (matchesShortcut(e) && !recordingShortcut) {
         e.preventDefault();
@@ -555,6 +553,7 @@ import addSound from './assets/Add.m4a?url';
     // Listen for theme changes from other windows
     unlistenTheme = await listen('theme-updated', (event) => {
       const newTheme = event.payload.theme;
+      if (newTheme === theme) return; // Guard against self-echo loop
       theme = newTheme;
       document.documentElement.setAttribute('data-theme', newTheme);
     });
@@ -586,15 +585,8 @@ import addSound from './assets/Add.m4a?url';
         particleSystem = new ParticleSystem(canvasRef);
         resizeObserver = new ResizeObserver(() => {
           if (canvasRef) { const r = canvasRef.parentElement.getBoundingClientRect(); canvasRef.width = r.width; canvasRef.height = r.height; }
-          if (outputCanvasRef) { const r = outputCanvasRef.parentElement.getBoundingClientRect(); outputCanvasRef.width = r.width; outputCanvasRef.height = r.height; }
         });
         resizeObserver.observe(canvasRef.parentElement);
-        if (outputCanvasRef) resizeObserver.observe(outputCanvasRef.parentElement);
-      }
-      if (outputCanvasRef) {
-        const rect = outputCanvasRef.parentElement.getBoundingClientRect();
-        outputCanvasRef.width = rect.width; outputCanvasRef.height = rect.height;
-        outputParticleSystem = new ParticleSystem(outputCanvasRef);
       }
     }, 100);
 
@@ -612,33 +604,11 @@ import addSound from './assets/Add.m4a?url';
 
     deleteHandler = (e) => {
       if (e.key !== 'Delete') return;
-      const tag = document.activeElement?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.target.closest('input, textarea, .edit-mode, .add-input')) return;
       if (inputSelections.length > 0) handleBatchRemoveInputs();
       else if (outputSelections.length > 0) handleBatchRemoveOutputs();
     };
     document.addEventListener('keydown', deleteHandler);
-  });
-
-  let lastOutputDimensions = $state({ width: 0, height: 0 });
-  $effect(() => {
-    const ref = outputCanvasRef;
-    const _docked = outputDocked;
-    if (!ref || !ref.parentElement) return;
-    const t = setTimeout(() => {
-      if (!ref.parentElement) return;
-      const rect = ref.parentElement.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        if (rect.width !== lastOutputDimensions.width || rect.height !== lastOutputDimensions.height) {
-          lastOutputDimensions = { width: rect.width, height: rect.height };
-          ref.width = rect.width;
-          ref.height = rect.height;
-          if (outputParticleSystem) outputParticleSystem.destroy();
-          outputParticleSystem = new ParticleSystem(ref);
-        }
-      }
-    }, 50);
-    return () => clearTimeout(t);
   });
 
   let prevParticlesEnabled = particlesEnabled;
@@ -658,12 +628,11 @@ import addSound from './assets/Add.m4a?url';
     if (unlistenAccent) unlistenAccent();
     if (unlistenTheme) unlistenTheme();
     if (registeredShortcut) { try { await unregister(registeredShortcut); } catch {} registeredShortcut = null; }
-    if (shortcutHandler) document.removeEventListener('keydown', shortcutHandler);
+    if (shortcutHandler) document.removeEventListener('keydown', shortcutHandler, true);
     if (deleteHandler) document.removeEventListener('keydown', deleteHandler);
     if (visibilityChangeHandler) document.removeEventListener('visibilitychange', visibilityChangeHandler);
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (particleSystem) particleSystem.destroy();
-    if (outputParticleSystem) outputParticleSystem.destroy();
   });
 
   async function handleAddInput(value) {
@@ -674,12 +643,14 @@ import addSound from './assets/Add.m4a?url';
     } else {
       await rpc('add_inputs', { values: parts });
     }
+    await refreshState();
     emit('state-updated');
     playSound(addSound);
   }
 
   async function handleClearInputs() {
     await rpc('clear_inputs'); inputSelections = [];
+    await refreshState();
     playSound(clearSound);
     emit('state-updated');
   }
@@ -739,27 +710,15 @@ import addSound from './assets/Add.m4a?url';
         return;
       }
       latestOutput = result;
+      outputGenerationCount++;
       if (notifyOnShortcut && !document.hasFocus()) {
         playSound(notificationSound);
       } else {
         playSound(singleOutputSound);
       }
-      if (particlesEnabled && outputCanvasRef) {  // Visual feedback via particle effects
-        if (!outputParticleSystem || !outputCanvasRef.parentElement) {  // Initialize or resize particle system
-          const rect = outputCanvasRef.parentElement?.getBoundingClientRect();
-          if (rect?.width > 0) {
-            outputCanvasRef.width = rect.width;  // Match container width
-            outputCanvasRef.height = rect.height;
-            outputParticleSystem = new ParticleSystem(outputCanvasRef);
-          }
-        }
-        if (outputParticleSystem) {
-          outputParticleSystem.gentleRise(150, tempColor);  // Gentle particle animation on color match
-          outputParticleSystem.startAnimation();
-        }
-      }
       const latestField = latestFieldRef;
       if (latestField) { latestField.classList.add('pulse'); setTimeout(() => latestField.classList.remove('pulse'), 600); }
+      await refreshState();
       emit('state-updated');
       if (centerPanelRef) { centerPanelRef.classList.remove('animate-border'); void centerPanelRef.offsetWidth; centerPanelRef.classList.add('animate-border'); }
     } finally {
@@ -777,6 +736,7 @@ import addSound from './assets/Add.m4a?url';
     const indices = [...inputSelections];
     await rpc('remove_inputs', { indices });
     inputSelections = [];
+    await refreshState();
     emit('state-updated');
     playSound(removeSound);
   }
@@ -798,6 +758,7 @@ import addSound from './assets/Add.m4a?url';
     if (outputSelections.length === 0) return;
     await rpc('remove_outputs', { values: outputSelections });
     outputSelections = [];
+    await refreshState();
     emit('state-updated');
     playSound(removeSound);
   }
@@ -845,6 +806,7 @@ import addSound from './assets/Add.m4a?url';
   async function handleClearOutputs() {
     showCompletionModal = false;
     await rpc('clear_outputs'); latestOutput = null; outputSelections = [];
+    await refreshState();
     emit('state-updated');
     playSound(clearSound);
   }
@@ -862,6 +824,7 @@ import addSound from './assets/Add.m4a?url';
     if (editingInputIndex === -1 || !editValue.trim()) return;
     await rpc('update_input', { index: editingInputIndex, value: editValue.trim() });
     editingInputIndex = -1; editValue = '';
+    await refreshState();
     emit('state-updated');
     playSound(addSound);
   }
@@ -872,6 +835,8 @@ import addSound from './assets/Add.m4a?url';
     outputMode = mode;
     localStorage.setItem('rng-output-mode', mode);
     await rpc('set_output_mode', { mode });
+    await refreshState();
+    emit('state-updated');
     playSound(buttonGenericSound);
   }
 
@@ -886,24 +851,11 @@ import addSound from './assets/Add.m4a?url';
       return;
     }
     latestOutput = null;
+    outputGenerationCount++;
     if (notifyOnShortcut && !document.hasFocus()) {
       playSound(notificationSound);
     } else {
       playSound(batchOutputSound);
-    }
-    if (particlesEnabled && outputCanvasRef) {
-      if (!outputParticleSystem || !outputCanvasRef.parentElement) {
-        const rect = outputCanvasRef.parentElement?.getBoundingClientRect();
-        if (rect?.width > 0) {
-          outputCanvasRef.width = rect.width;
-          outputCanvasRef.height = rect.height;
-          outputParticleSystem = new ParticleSystem(outputCanvasRef);
-        }
-      }
-      if (outputParticleSystem) {
-        outputParticleSystem.gentleRise(150, tempColor);
-        outputParticleSystem.startAnimation();
-      }
     }
     await refreshState();
     emit('state-updated');
@@ -1019,11 +971,11 @@ import addSound from './assets/Add.m4a?url';
 <!-- Shortcut recording overlay -->
 {#if recordingShortcut}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="shortcut-overlay" onclick={() => { recordingShortcut = false; generating = false; if (captureListener) { document.removeEventListener('keydown', captureListener, true); captureListener = null; } }}>
+  <div class="shortcut-overlay" onclick={() => { recordingShortcut = false; if (captureListener) { document.removeEventListener('keydown', captureListener, true); captureListener = null; } }}>
     <div class="shortcut-dialog">
       <p>Press your new shortcut combination…</p>
       <small style="color: var(--text-secondary)">e.g. Ctrl+Shift+G, Alt+R</small>
-      <button onclick={() => { recordingShortcut = false; generating = false; if (captureListener) { document.removeEventListener('keydown', captureListener, true); captureListener = null; } }}>Cancel</button>
+      <button onclick={() => { recordingShortcut = false; if (captureListener) { document.removeEventListener('keydown', captureListener, true); captureListener = null; } }}>Cancel</button>
     </div>
   </div>
 {/if}
@@ -1041,91 +993,45 @@ import addSound from './assets/Add.m4a?url';
 
 <!-- Standalone panel windows -->
 {#if panelMode === 'inputs'}
-  <div class="standalone-panel">
-    <div class="sidebar-header">
-      <span class="sidebar-title">Inputs</span>
-<div class="sidebar-actions">
-        {#if inputSelections.length > 0}
-          <button class="icon-btn icon-remove" onclick={handleBatchRemoveInputs} title="Delete selected ({inputSelections.length})">{@html removeIcon}</button>
-          <button class="icon-btn icon-unselect" onclick={unselectAllInputs} title="Unselect all">{@html unselectIcon}</button>
-        {:else}
-  <button class="icon-btn icon-clear" onclick={() => handleClearInputs()} title="Clear all">{@html clearIcon}</button>
-        {/if}
-        {#if inputSelections.length === 0}
-        <button class="icon-btn icon-add" onclick={async () => { const el = document.getElementById('inputFieldStandalone'); if (el?.value.trim()) { await handleAddInput(el.value); el.value = ''; } else el?.focus(); }} title="Add">{@html addIcon}</button>
-        {/if}
-  <button class="icon-btn icon-dock" onclick={async () => { try { new Audio(dockSound).play(); } catch {} emit('dock-panel', { panel: 'inputs' }); }} title="Dock">{@html dockIcon}</button>
-      </div>
-    </div>
-    {#if inputs.length > 5}
-      <input type="text" class="filter-input" placeholder="Filter..." bind:value={inputFilter} />
-    {/if}
-    <div class="list-wrapper" use:dragContainer={'input'}>
-      <div class="input-list">
-        {#each filteredInputIndices as { value: item, index: origIndex } (origIndex)}
-          {#if editingInputIndex === origIndex}
-            <div class="list-item edit-mode" onclick={(e) => e.stopPropagation()}>
-              <input type="text" class="edit-input" bind:value={editValue} autofocus
-                onkeydown={(e) => { if (e.key === 'Enter') { saveEdit(); e.preventDefault(); } else if (e.key === 'Escape') { cancelEdit(); e.preventDefault(); } }} />
-              <button class="edit-cancel" onclick={() => { cancelEdit(); playSound(buttonGenericSound); }}>✕</button>
-            </div>
-          {:else}
-            <div class="list-item" class:selected={inputSelections.includes(origIndex)}
-              data-index={origIndex}
-              onclick={(e) => handleItemSelect(e, 'input')} tabindex="0"
-              onkeydown={(e) => { if (e.key === 'ArrowDown') { e.preventDefault(); focusedInputIndex = Math.min(origIndex + 1, inputs.length - 1); document.querySelectorAll('.input-list .list-item')[focusedInputIndex]?.focus(); } else if (e.key === 'ArrowUp') { e.preventDefault(); focusedInputIndex = Math.max(origIndex - 1, 0); document.querySelectorAll('.input-list .list-item')[focusedInputIndex]?.focus(); } else if ((e.key === 'Enter' || e.key === ' ') && !e.target.classList.contains('checkmark')) { toggleInputSelect(origIndex); e.preventDefault(); } }}>
-              <span class="drag-handle" title="Drag to reorder">{@html dragIndicatorIcon}</span>
-              <span class="checkmark-wrap"><input type="checkbox" class="checkmark" onclick={(e) => { e.stopPropagation(); toggleInputSelect(origIndex); }} checked={inputSelections.includes(origIndex)} /></span>
-              <span class="item-number">{origIndex + 1}.</span>
-              <span class="item-text">{item}</span>
-              <span class="edit-link" onclick={(e) => { e.stopPropagation(); startEditing(origIndex, item); }}>Edit</span>
-            </div>
-          {/if}
-        {:else}
-          <div class="empty-state">No inputs added yet</div>
-        {/each}
-      </div>
-    </div>
-    <div class="add-input-container">
-      <input id="inputFieldStandalone" type="text" class="add-input" placeholder="Type and press Enter..."
-        onkeydown={(e) => { if (e.key === 'Enter') { handleAddInput(e.target.value); e.target.value = ''; } }} />
-    </div>
-  </div>
+  <InputSidebar
+    items={filteredInputIndices}
+    selections={inputSelections}
+    filter={inputFilter}
+    editingIndex={editingInputIndex}
+    {editValue}
+    mode="standalone"
+    dragAction={dragContainer}
+    onAdd={handleAddInput}
+    onClear={handleClearInputs}
+    onRemoveSelected={handleBatchRemoveInputs}
+    onUnselectAll={unselectAllInputs}
+    onStartEditing={startEditing}
+    onSaveEdit={saveEdit}
+    onCancelEdit={cancelEdit}
+    onToggleSelect={toggleInputSelect}
+    onFilterChange={(v) => { inputFilter = v; }}
+    onEditValueChange={(v) => { editValue = v; }}
+    onToggleDock={() => { emit('dock-panel', { panel: 'inputs' }); }}
+    soundFiles={{ dockSound }}
+  />
 {:else if panelMode === 'outputs'}
-  <div class="standalone-panel">
-    <div class="sidebar-header">
-      <span class="sidebar-title">Outputs</span>
-      <div class="sidebar-actions">
-        {#if outputSelections.length > 0}
-          <button class="icon-btn icon-remove" onclick={handleBatchRemoveOutputs} title="Delete selected ({outputSelections.length})">{@html removeIcon}</button>
-          <button class="icon-btn icon-unselect" onclick={unselectAllOutputs} title="Unselect all">{@html unselectIcon}</button>
-        {:else}
-          <button class="icon-btn icon-clear" onclick={() => handleClearOutputs()} title="Clear all">{@html clearIcon}</button>
-        {/if}
-        <button class="icon-btn icon-dock" onclick={async () => { try { new Audio(dockSound).play(); } catch {} emit('dock-panel', { panel: 'outputs' }); }} title="Dock">{@html dockIcon}</button>
-      </div>
-    </div>
-    {#if outputs.length > 5}
-      <input type="text" class="filter-input" placeholder="Filter..." bind:value={outputFilter} />
-    {/if}
-    <div class="list-wrapper">
-      <div class="output-list">
-        {#each filteredOutputIndices as { value: item, index: origIndex } (origIndex)}
-          <div class="list-item" class:latest-output-item={origIndex === outputs.length - 1}
-            class:selected={outputSelections.includes(item)} data-index={origIndex} data-value={item}
-            onclick={(e) => handleItemSelect(e, 'output')} tabindex="0"
-            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { toggleOutputSelect(item); e.preventDefault(); } }}
-            style="border-left: 3px solid var(--accent);">
-            <span class="checkmark-wrap"><input type="checkbox" class="checkmark" onclick={(e) => { e.stopPropagation(); toggleOutputSelect(item); }} checked={outputSelections.includes(item)} /></span>
-            <span class="item-number">{origIndex + 1}.</span>
-            <span class="item-text">{item}</span>
-          </div>
-        {:else}
-          <div class="empty-state">No outputs yet</div>
-        {/each}
-      </div>
-    </div>
-  </div>
+  <OutputSidebar
+    items={filteredOutputIndices}
+    selections={outputSelections}
+    filter={outputFilter}
+    mode="standalone"
+    {latestOutput}
+    accentColor={tempColor}
+    {particlesEnabled}
+    generationTrigger={outputGenerationCount}
+    onClear={handleClearOutputs}
+    onRemoveSelected={handleBatchRemoveOutputs}
+    onUnselectAll={unselectAllOutputs}
+    onToggleSelect={toggleOutputSelect}
+    onFilterChange={(v) => { outputFilter = v; }}
+    onToggleDock={() => { emit('dock-panel', { panel: 'outputs' }); }}
+    soundFiles={{ dockSound }}
+  />
 {:else}
 <div class="app-layout"
   class:input-undocked={!inputDocked}
@@ -1133,58 +1039,28 @@ import addSound from './assets/Add.m4a?url';
 
   <!-- Left sidebar (docked) -->
   {#if inputDocked}
-    <div class="sidebar">
-      <div class="sidebar-header">
-        <span class="sidebar-title">Inputs</span>
-<div class="sidebar-actions">
-          {#if inputSelections.length > 0}
-            <button class="icon-btn icon-remove" onclick={handleBatchRemoveInputs} title="Delete selected ({inputSelections.length})">{@html removeIcon}</button>
-            <button class="icon-btn icon-unselect" onclick={unselectAllInputs} title="Unselect all">{@html unselectIcon}</button>
-          {:else}
-  <button class="icon-btn icon-clear" onclick={() => handleClearInputs()} title="Clear all">{@html clearIcon}</button>
-          {/if}
-          {#if inputSelections.length === 0}
-          <button class="icon-btn icon-add" onclick={async () => { const el = document.getElementById('inputField'); if (el?.value.trim()) { await handleAddInput(el.value); el.value = ''; } else el?.focus(); }} title="Add">{@html addIcon}</button>
-          {/if}
-          <button class="icon-btn icon-save" onclick={saveInputsList} title="Save inputs">{@html saveIcon}</button>
-          <button class="icon-btn icon-load" onclick={loadInputsList} title="Load inputs">{@html importIcon}</button>
-  <button class="icon-btn icon-undock" onclick={toggleInputDock} title="Undock">{@html undockIcon}</button>
-        </div>
-      </div>
-      {#if inputs.length > 5}
-        <input type="text" class="filter-input" placeholder="Filter..." bind:value={inputFilter} />
-      {/if}
-      <div class="list-wrapper" use:dragContainer={'input'}>
-        <div class="input-list">
-          {#each filteredInputIndices as { value: item, index: origIndex } (origIndex)}
-            {#if editingInputIndex === origIndex}
-              <div class="list-item edit-mode" onclick={(e) => e.stopPropagation()}>
-                <input type="text" class="edit-input" bind:value={editValue} autofocus
-                  onkeydown={(e) => { if (e.key === 'Enter') { saveEdit(); e.preventDefault(); } else if (e.key === 'Escape') { cancelEdit(); e.preventDefault(); } }} />
-                <button class="edit-cancel" onclick={() => { cancelEdit(); playSound(buttonGenericSound); }}>✕</button>
-              </div>
-            {:else}
-              <div class="list-item" class:selected={inputSelections.includes(origIndex)}
-                data-index={origIndex}
-                onclick={(e) => handleItemSelect(e, 'input')} tabindex="0"
-                onkeydown={(e) => { if (e.key === 'ArrowDown') { e.preventDefault(); focusedInputIndex = Math.min(origIndex + 1, inputs.length - 1); document.querySelectorAll('.input-list .list-item')[focusedInputIndex]?.focus(); } else if (e.key === 'ArrowUp') { e.preventDefault(); focusedInputIndex = Math.max(origIndex - 1, 0); document.querySelectorAll('.input-list .list-item')[focusedInputIndex]?.focus(); } else if ((e.key === 'Enter' || e.key === ' ') && !e.target.classList.contains('checkmark')) { toggleInputSelect(origIndex); e.preventDefault(); } }}>
-                <span class="drag-handle" title="Drag to reorder">{@html dragIndicatorIcon}</span>
-                <span class="checkmark-wrap"><input type="checkbox" class="checkmark" onclick={(e) => { e.stopPropagation(); toggleInputSelect(origIndex); }} checked={inputSelections.includes(origIndex)} /></span>
-                <span class="item-number">{origIndex + 1}.</span>
-                <span class="item-text">{item}</span>
-                <span class="edit-link" onclick={(e) => { e.stopPropagation(); startEditing(origIndex, item); }}>Edit</span>
-              </div>
-            {/if}
-          {:else}
-            <div class="empty-state">No inputs added yet</div>
-          {/each}
-        </div>
-      </div>
-      <div class="add-input-container">
-        <input id="inputField" type="text" class="add-input" placeholder="Type and press Enter..."
-          onkeydown={(e) => { if (e.key === 'Enter') { handleAddInput(e.target.value); e.target.value = ''; } }} />
-      </div>
-    </div>
+    <InputSidebar
+      items={filteredInputIndices}
+      selections={inputSelections}
+      filter={inputFilter}
+      editingIndex={editingInputIndex}
+      {editValue}
+      mode="docked"
+      dragAction={dragContainer}
+      onAdd={handleAddInput}
+      onClear={handleClearInputs}
+      onRemoveSelected={handleBatchRemoveInputs}
+      onUnselectAll={unselectAllInputs}
+      onSave={saveInputsList}
+      onLoad={loadInputsList}
+      onToggleDock={toggleInputDock}
+      onStartEditing={startEditing}
+      onSaveEdit={saveEdit}
+      onCancelEdit={cancelEdit}
+      onToggleSelect={toggleInputSelect}
+      onFilterChange={(v) => { inputFilter = v; }}
+      onEditValueChange={(v) => { editValue = v; }}
+    />
   {:else}
     <div class="sidebar-placeholder"></div>
   {/if}
@@ -1225,7 +1101,7 @@ import addSound from './assets/Add.m4a?url';
             </div>
             <div class="cp-output">
               <div class="cp-swatch" style="background: {tempColor};"></div>
-              <input class="cp-hex" bind:value={tempColor} oninput={(e) => { if (/^#[0-9A-Fa-f]{6}$/.test(e.currentTarget.value)) updateAccentColor(e.currentTarget.value); }} />
+              <input class="cp-hex" value={tempColor} oninput={(e) => { const v = e.currentTarget.value; tempColor = v; if (/^#[0-9A-Fa-f]{6}$/.test(v)) updateAccentColor(v); }} />
             </div>
             <button class="cp-close-btn" onclick={() => { colorPickerOpen = false; playSound(buttonGenericSound); }}>Close</button>
           </div>
@@ -1288,48 +1164,26 @@ import addSound from './assets/Add.m4a?url';
     <div class="mode-status">Mode: {outputMode.charAt(0).toUpperCase() + outputMode.slice(1)}</div>
 
     <canvas class="particle-canvas" bind:this={canvasRef}></canvas>
-    {#if !outputDocked}
-    <canvas class="output-particle-canvas" bind:this={outputCanvasRef}></canvas>
-    {/if}
   </div>
 
   <!-- Right sidebar (docked) -->
   {#if outputDocked}
-    <div class="sidebar">
-      <div class="sidebar-header">
-        <span class="sidebar-title">Outputs</span>
-        <div class="sidebar-actions">
-          {#if outputSelections.length > 0}
-<button class="icon-btn icon-remove" onclick={handleBatchRemoveOutputs} title="Delete selected ({outputSelections.length})">{@html removeIcon}</button>
-            <button class="icon-btn icon-unselect" onclick={unselectAllOutputs} title="Unselect all">{@html unselectIcon}</button>
-          {:else}
-            <button class="icon-btn icon-clear" onclick={() => handleClearOutputs()} title="Clear all">{@html clearIcon}</button>
-          {/if}
-  <button class="icon-btn icon-undock" onclick={toggleOutputDock} title="Undock">{@html undockIcon}</button>
-        </div>
-      </div>
-      {#if outputs.length > 5}
-        <input type="text" class="filter-input" placeholder="Filter..." bind:value={outputFilter} />
-      {/if}
-      <div class="list-wrapper">
-        <div class="output-list">
-          {#each filteredOutputIndices as { value: item, index: origIndex } (origIndex)}
-            <div class="list-item" class:latest-output-item={origIndex === outputs.length - 1}
-              class:selected={outputSelections.includes(item)} data-index={origIndex} data-value={item}
-              onclick={(e) => handleItemSelect(e, 'output')} tabindex="0"
-              onkeydown={(e) => { if (e.key === 'ArrowDown') { e.preventDefault(); focusedOutputIndex = Math.min(origIndex + 1, outputs.length - 1); document.querySelectorAll('.output-list .list-item')[focusedOutputIndex]?.focus(); } else if (e.key === 'ArrowUp') { e.preventDefault(); focusedOutputIndex = Math.max(origIndex - 1, 0); document.querySelectorAll('.output-list .list-item')[focusedOutputIndex]?.focus(); } else if (e.key === 'Enter' || e.key === ' ') { toggleOutputSelect(item); e.preventDefault(); } }}
-              style="border-left: 3px solid var(--accent);">
-              <span class="checkmark-wrap"><input type="checkbox" class="checkmark" onclick={(e) => { e.stopPropagation(); toggleOutputSelect(item); }} checked={outputSelections.includes(item)} /></span>
-              <span class="item-number">{origIndex + 1}.</span>
-              <span class="item-text">{item}</span>
-            </div>
-          {:else}
-            <div class="empty-state">No outputs yet</div>
-          {/each}
-        </div>
-      </div>
-      <canvas class="output-particle-canvas" bind:this={outputCanvasRef}></canvas>
-    </div>
+    <OutputSidebar
+      items={filteredOutputIndices}
+      selections={outputSelections}
+      filter={outputFilter}
+      mode="docked"
+      {latestOutput}
+      accentColor={tempColor}
+      {particlesEnabled}
+      generationTrigger={outputGenerationCount}
+      onClear={handleClearOutputs}
+      onRemoveSelected={handleBatchRemoveOutputs}
+      onUnselectAll={unselectAllOutputs}
+      onToggleDock={toggleOutputDock}
+      onToggleSelect={toggleOutputSelect}
+      onFilterChange={(v) => { outputFilter = v; }}
+    />
   {:else}
     <div class="sidebar-placeholder"></div>
   {/if}
@@ -1350,25 +1204,29 @@ import addSound from './assets/Add.m4a?url';
     --text-primary: #e6edf3;
     --text-secondary: #8b949e;
     --accent: #263ed2;
+    --accent-glow: rgba(38, 62, 210, 0.3);
+    --accent-bg-hover: rgba(38, 62, 210, 0.1);
+    --accent-glow-medium: rgba(38, 62, 210, 0.15);
   }
 
-  .standalone-panel {
+  :global(.standalone-panel) {
     width: 100%;
     height: 100vh;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border-color);
     display: flex;
     flex-direction: column;
+    position: relative;
   }
 
-  .standalone-panel .input-list,
-  .standalone-panel .output-list {
+  :global(.standalone-panel .input-list),
+  :global(.standalone-panel .output-list) {
     flex: 1;
     overflow-y: auto;
     padding: 8px;
   }
 
-  .standalone-panel .empty-state {
+  :global(.standalone-panel .empty-state) {
     color: var(--text-secondary);
     text-align: center;
     padding: 20px;
@@ -1529,7 +1387,6 @@ import addSound from './assets/Add.m4a?url';
     transition: all 0.15s ease;
   }
 
-  .list-item:hover :global(.edit-link) { color: var(--text-secondary); }
   :global(.edit-link:hover) { color: var(--text-primary) !important; background: var(--bg-quaternary); }
 
   :global(.input-list), :global(.output-list) {
@@ -1586,25 +1443,8 @@ import addSound from './assets/Add.m4a?url';
     flex-shrink: 0;
   }
 
-  .list-item {
-    padding: 9px 8px;
-    margin-bottom: 3px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    cursor: pointer;
-    transition: all 0.15s ease;
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    line-height: normal;
-  }
-
-  .list-item:hover { border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
-  .list-item.selected { border-color: var(--accent); background: var(--accent-bg-hover); }
-
-  .input-list .list-item { background: var(--bg-input-item); }
-  .output-list .list-item { background: var(--bg-output-item); justify-content: flex-start; }
+  :global(.input-list .list-item) { background: var(--bg-input-item); }
+  :global(.output-list .list-item) { background: var(--bg-output-item); justify-content: flex-start; }
 
   :global(.center-panel) {
     display: flex;
@@ -1746,17 +1586,17 @@ import addSound from './assets/Add.m4a?url';
     0%, 100% { filter: drop-shadow(0 0 0 transparent); }
     50% { filter: drop-shadow(0 0 8px var(--accent-glow)) drop-shadow(0 0 16px var(--accent-bg-hover)); }
   }
-  .list-item.dragging {
+  :global(.list-item.dragging) {
     opacity: 0.35;
     background: var(--accent-bg-hover);
   }
 
-  .list-wrapper.is-dragging {
+  :global(.list-wrapper.is-dragging) {
     cursor: grabbing;
     user-select: none;
   }
 
-  .list-wrapper.is-dragging .list-item {
+  :global(.list-wrapper.is-dragging .list-item) {
     cursor: grabbing;
   }
 
@@ -1782,18 +1622,6 @@ import addSound from './assets/Add.m4a?url';
     position: absolute; top: 0; left: 0; pointer-events: none;
     z-index: 1000;
   }
-
-  .edit-input {
-    background-color: var(--bg-primary); color: var(--text-primary);
-    border: 1px solid var(--border-color); border-radius: 6px;
-    padding: 7px; font-size: 13px; width: 100%; box-sizing: border-box; outline: none;
-  }
-
-  .edit-cancel {
-    background: transparent; border: none; color: var(--text-secondary); cursor: pointer;
-    font-size: 14px; padding: 0 6px; opacity: 0.7;
-  }
-  .edit-cancel:hover { opacity: 1; color: var(--accent); }
 
   :global(.latest-output-field) {
     width: 100%; min-height: 48px; padding: 12px 16px;
@@ -1827,13 +1655,6 @@ import addSound from './assets/Add.m4a?url';
 
   .completion-modal h2 { margin-bottom: 16px; color: var(--text-primary); }
   .modal-actions { display: flex; gap: 12px; justify-content: center; margin-top: 24px; }
-
-  .btn-primary { padding: 9px 22px; background: var(--accent); border: none; border-radius: 8px; color: white; font-size: 13px; cursor: pointer; transition: all 0.15s ease; }
-  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 16px var(--accent-glow); }
-  .btn-secondary { padding: 9px 22px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-size: 13px; cursor: pointer; }
-  .btn-secondary:hover { border-color: var(--accent); }
-
-  .empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary); font-size: 13px; text-align: center; padding: 16px; }
 
   .mode-status { font-size: 11px; color: var(--text-secondary); letter-spacing: 0.3px; }
 

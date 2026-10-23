@@ -6,7 +6,9 @@
   --text-primary: #e6edf3;
   --text-secondary: #8b949e;
   --accent: #2015b6;
-  --accent-glow: rgba(0, 0, 0, 0.3);
+  --accent-glow: rgba(32, 21, 182, 0.3);
+  --accent-bg-hover: rgba(32, 21, 182, 0.1);
+  --accent-glow-medium: rgba(32, 21, 182, 0.15);
 }
 
 [data-theme="light"] {
@@ -19,6 +21,8 @@
   --text-secondary: #656d76;
   --accent: #2015b6;
   --accent-glow: rgba(32, 21, 182, 0.3);
+  --accent-bg-hover: rgba(32, 21, 182, 0.1);
+  --accent-glow-medium: rgba(32, 21, 182, 0.15);
 }
 
 * {
